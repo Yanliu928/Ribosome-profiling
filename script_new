@@ -1,0 +1,189 @@
+## Quality Control Checks On The Fastq Files
+------------------------------------------------------------------------
+#!/usr/bin/env bash
+
+#SBATCH --cpus-per-task=1
+#SBATCH --mem-per-cpu=1000M
+#SBATCH --time=01:00:00
+#SBATCH --job-name=QualityControl
+#SBATCH --mail-user=yan.liu@students.unibe.ch
+#SBATCH --mail-type=end,error
+#SBATCH --output=/data/users/yanliu/output_qc_%j.o
+#SBATCH --error=/data/users/yanliu/error_qc_%j.e
+
+module add UHTS/Quality_control/fastqc/0.11.7
+module add UHTS/Analysis/MultiQC/1.8
+
+cd /data/users/yanliu/RNAseq/sequences/
+
+fastqc SRR9596295.fastq  SRR9596300.fastq  SRR9596304.fastq  SRR9596296.fastq  SRR9596303.fastq  SRR9596310.fastq
+multiqc .
+------------------------------------------------------------------------
+
+**************************************************************************************
+## To Clip The Adapter:
+
+cd /data/users/yanliu/RNAseq/sequences/
+module add UHTS/Analysis/fastx_toolkit/0.0.13.2
+for x in $(ls -d *.fastq); do echo ${x}; fastx_clipper -Q 33 -a AGATCGGAAGAGCAC -v -c -l 25 -i ${x} -o $(basename ${x} .fastq)_clipped.fastq > /dev/null; done
+
+**************************************************************************************
+## To Trim 10 nt From The 3' end:
+
+for x in $(ls -d *clipped.fastq); do echo ${x}; fastx_trimmer -Q 33 -t 10 -m 25 -i ${x} -o $(basename ${x} .fastq)_t10.fastq > /dev/null; done
+
+**************************************************************************************
+## To Trim 2 nt From The 5' end:
+
+for x in $(ls -d *t10.fastq); do echo ${x}; fastx_trimmer -Q 33 -f 2 -m 25 -i ${x} -o $(basename ${x} .fastq)_f2_tr.fastq > /dev/null; done
+mkdir ../undesired_moved
+mv *tr.fastq ../undesired_moved
+
+**************************************************************************************
+## To Build The Annotation Index Files
+------------------------------------------------------------------------
+#!/usr/bin/env bash
+
+#SBATCH --cpus-per-task=4
+#SBATCH --mem-per-cpu=8000M
+#SBATCH --time=04:00:00
+#SBATCH --job-name=BUildIndex
+#SBATCH --mail-user=yan.liu@students.unibe.ch
+#SBATCH --mail-type=end,error
+#SBATCH --output=/data/users/yanliu/output_qc_%j.o
+#SBATCH --error=/data/users/yanliu/error_qc_%j.e
+#SBATCH --partition=pcourse80
+#SBATCH --array=0-2
+
+module add UHTS/Aligner/bowtie/1.2.0
+
+cd /data/users/yanliu/RNAseq/annotation_prepare/
+FILES=(*.fasta)
+
+bowtie-build \
+${FILES[$SLURM_ARRAY_TASK_ID]} \
+${FILES[$SLURM_ARRAY_TASK_ID]}
+
+mkdir Transcriptome_annotation_index
+mv *Transcriptome*.ebwt Transcriptome_annotation_index/
+
+mkdir toplevel_index
+mv *toplevel*.ebwt toplevel_index/
+
+mkdir undesired
+mv undesired*.ebwt undesired/
+------------------------------------------------------------------------
+
+**************************************************************************************
+## Removing The Undesired Reads
+------------------------------------------------------------------------
+#!/usr/bin/env bash
+
+#SBATCH --cpus-per-task=4
+#SBATCH --mem-per-cpu=8000M
+#SBATCH --time=03:00:00
+#SBATCH --job-name=UndesiredMapping
+#SBATCH --mail-user=yan.liu@students.unibe.ch
+#SBATCH --mail-type=end,error
+#SBATCH --output=/data/users/yanliu/output_qc_%j.o
+#SBATCH --error=/data/users/yanliu/error_qc_%j.e
+#SBATCH --array=0-5
+#SBATCH --partition=pcourse80
+
+module add UHTS/Aligner/bowtie/1.2.0
+
+cd /data/users/yanliu/RNAseq/undesired_moved/
+
+FILES=(*.fastq)
+
+bowtie \
+-t \
+--threads 4 \
+/data/users/yanliu/RNAseq/annotation_prepare/undesired/undesired.fasta \
+-q ${FILES[$SLURM_ARRAY_TASK_ID]} \
+--un UND${FILES[$SLURM_ARRAY_TASK_ID]} 2> ${FILES[$SLURM_ARRAY_TASK_ID]}.log
+
+mkdir ../map_undesired
+mv UND*.fastq ../map_undesired/
+
+------------------------------------------------------------------------
+
+**************************************************************************************
+## Mapping The Files To Transcriptome
+------------------------------------------------------------------------
+#!/usr/bin/env bash
+
+#SBATCH --cpus-per-task=4
+#SBATCH --mem-per-cpu=8000M
+#SBATCH --time=03:00:00
+#SBATCH --job-name=TransMapping
+#SBATCH --mail-user=yan.liu@students.unibe.ch
+#SBATCH --mail-type=end,error
+#SBATCH --output=/data/users/yanliu/output_qc_%j.o
+#SBATCH --error=/data/users/yanliu/error_qc_%j.e
+#SBATCH --array=0-5
+#SBATCH --partition=pcourse80
+
+module add UHTS/Aligner/bowtie/1.2.0
+
+cd /data/users/yanliu/RNAseq/map_undesired/
+
+FILES=(*.fastq)
+
+bowtie \
+-t \
+--threads 4 \
+-v 1 \
+-m 1 \
+--norc \
+--best \
+--strata \
+/data/users/yanliu/RNAseq/annotation_prepare/Transcriptome_annotation_index/Transcriptome_annotation.fasta 
+-q ${FILES[$SLURM_ARRAY_TASK_ID]} \
+-S Trans_${FILES[$SLURM_ARRAY_TASK_ID]}.sam 2> Trans_${FILES[$SLURM_ARRAY_TASK_ID]}.log
+
+mkdir ../Trans_sam
+mv *.sam ../Trans_sam/
+------------------------------------------------------------------------
+
+**************************************************************************************
+## Mapping The Files To Genome (After Removing The rRNA etc) & Convert Sam Files To Bam Files
+
+module add UHTS/Aligner/bowtie/1.2.0
+module add UHTS/Analysis/samtools/1.10
+cd /data/users/yanliu/RNAseq/map_undesired/
+for x in $(ls -d *.fastq); do echo ${x}; bowtie -S -t -p 4 -v 1 -m 1 --best --strata /data/users/yanliu/RNAseq/annotation_prepare/toplevel_index/Rattus_norvegicus.Rnor_6.0.dna.toplevel.fasta -q ${x} 2> $(basename ${x} .fastq)_Rnor_6.log | samtools view -h -F 4 -b > $(basename ${x} .fastq)_Rnor_6.bam; done
+
+**************************************************************************************
+## Sorting The Bam Files
+
+module add UHTS/Analysis/samtools/1.10
+for x in $(ls -d *t10_f2_tr_Rnor_6.bam); do echo ${x}; samtools sort -@ 10 ${x} -o $(basename ${x} .bam)_sorted.bam; done
+
+mkdir ../genome_sorted_bams
+mv *bam ../genome_sorted_bams/
+
+**************************************************************************************
+## Fasta Files To 2bit Files:
+
+module add SequenceAnalysis/blat/36
+cd /data/users/yanliu/RNAseq/annotation_prepare/
+faToTwoBit Rattus_norvegicus.Rnor_6.0.dna.toplevel.fasta Rattus_norvegicus.Rnor_6.0.dna.toplevel.2bit
+
+**************************************************************************************
+## Feature Count:
+
+module add UHTS/Analysis/subread/2.0.1
+cd /data/users/yanliu/RNAseq/genome_sorted_bams/
+for x in $(ls -d *.bam); do echo ${x}; featureCounts -T 5 -t exon -g gene_id -a Rattus_norvegicus.Rnor_6.0.101.gtf -o counts_genome.txt ${x}; done
+cut -f 1,7-12 counts_genome.txt > biotype_counts_genome_processed.txt
+
+**************************************************************************************
+## Feature count for transcriptome:
+
+cd /data/users/yanliu/RNAseq/Trans_sam/
+module add UHTS/Analysis/samtools/1.10
+for i in *.sam ; do echo $i;a=${i/\.sam/} ; samtools view $i | awk '$3!="*"{hash[$3]++}END{for(i in hash){print "'$a'\t"i"\t"hash[i]}}' >>count_table.txt; done;
+
+
+
